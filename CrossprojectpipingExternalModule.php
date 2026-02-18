@@ -15,6 +15,10 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 
 	private static $isPipingInProgress = false;
 
+	/** Batch locking cache populated by prefetchLockingData(). Reserved for future batch optimization. */
+	private $lockingCache = null;
+	private $projectCache = [];
+
 	function redcap_every_page_before_render($project_id) {
 		$user_is_at_record_status_dashboard = $_SERVER['SCRIPT_NAME'] == APP_PATH_WEBROOT . "DataEntry/record_status_dashboard.php";
 		$pipe_all_records_button_configured = $this->getProjectSetting('piping-all-records-button');
@@ -76,9 +80,9 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 				$this->active_forms = [];  // framework quirk: [[0] => null]
 			}
 			$this->pipe_on_status = $this->getProjectSetting('pipe-on-status');
-			$this->formStatuses = $this->getFormStatusAllRecords($this->active_forms);
 
-			$this->pipeToRecord($record);
+			// Guarded piping — uses direct SQL guards instead of array-based formStatuses
+			$this->pipeToRecordSaveHook($record);
 		} finally {
 			self::$isPipingInProgress = false;
 		}
@@ -1004,7 +1008,109 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 		
 		return $data;
 	}
-	
+
+	/**
+	 * Checks whether a form/instance is locked.
+	 * Extracted from inline SQL in processRecord() (lines 382-386).
+	 */
+	function isFormLocked($project_id, $record, $event_id, $form_name, $instance) {
+		$project_id = intval($project_id);
+		$record = db_real_escape_string($record);
+		$event_id = intval($event_id);
+		$form_name = db_real_escape_string($form_name);
+		$instance = intval($instance);
+
+		$sql = "SELECT 1 FROM redcap_locking_data
+				WHERE project_id = $project_id
+				AND record = '$record'
+				AND event_id = $event_id
+				AND form_name = '$form_name'";
+
+		// Non-repeating forms may store instance as NULL or 1
+		if ($instance <= 1) {
+			$sql .= " AND (instance IS NULL OR instance = 1)";
+		} else {
+			$sql .= " AND instance = $instance";
+		}
+
+		$result = db_query($sql);
+		return db_num_rows($result) > 0;
+	}
+
+	/**
+	 * Checks whether a form's status exceeds the pipe-on-status threshold.
+	 * Extracted from inline SQL in processRecord() (lines 390-401).
+	 */
+	function isFormAbovePipeStatus($project_id, $record, $event_id, $form_name, $instance, $pipe_on_status) {
+		if ($pipe_on_status === null || $pipe_on_status === '') return false;
+
+		$project_id = intval($project_id);
+		$record = db_real_escape_string($record);
+		$event_id = intval($event_id);
+		$field_name = db_real_escape_string($form_name) . '_complete';
+		$instance = intval($instance);
+		$table = $this->getDataTable($project_id);
+
+		$sql = "SELECT value FROM $table
+				WHERE project_id = $project_id
+				AND record = '$record'
+				AND event_id = $event_id
+				AND field_name = '$field_name'";
+
+		// Data table stores non-repeating as instance IS NULL (never 1)
+		if ($instance <= 1) {
+			$sql .= " AND instance IS NULL";
+		} else {
+			$sql .= " AND instance = $instance";
+		}
+
+		$result = db_query($sql);
+		$row = db_fetch_assoc($result);
+		return !empty($row) && intval($row['value']) > intval($pipe_on_status);
+	}
+
+	/**
+	 * Checks whether a form is on the configured active-forms list.
+	 * Extracted from inline check in processRecord() (lines 374-378).
+	 */
+	function isFormOnActiveList($form_name, $active_forms) {
+		// Empty list or framework [null] quirk means all forms are active
+		if (empty($active_forms)) return true;
+		if (count($active_forms) == 1 && empty($active_forms[0])) return true;
+		return in_array($form_name, $active_forms);
+	}
+
+	/**
+	 * Batch-fetches all locking data for a project in a single SQL query.
+	 * Returns [$record][$event_id][$form_name][$instance] = true for O(1) lookups.
+	 * Currently unused — intended for future batch path optimization.
+	 */
+	function prefetchLockingData($project_id) {
+		$project_id = intval($project_id);
+		$sql = "SELECT record, event_id, form_name, instance
+				FROM redcap_locking_data
+				WHERE project_id = $project_id";
+		$result = db_query($sql);
+		$cache = [];
+		while ($row = db_fetch_assoc($result)) {
+			$inst = $row['instance'] ?? 1;
+			$cache[$row['record']][$row['event_id']][$row['form_name']][$inst] = true;
+		}
+		return $cache;
+	}
+
+	/**
+	 * Returns a cached \Project instance, avoiding repeated instantiation.
+	 * processDataTransfer() creates new \Project() on every call.
+	 */
+	function getCachedProject($pid) {
+		$pid = intval($pid);
+		if (!isset($this->projectCache[$pid])) {
+			$this->projectCache[$pid] = new \Project($pid);
+		}
+		return $this->projectCache[$pid];
+	}
+
 	function getSourceProjectsData() {
 		if (gettype($this->projects['source']) == 'Array') {
 			throw new \Exception("The Cross Project Piping module expected \$module->projects['source'] to be an array before calling pipeToRecord()");
@@ -1122,6 +1228,102 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 		}
 
         return $returnarray;
+	}
+
+	/**
+	 * Save-hook piping wrapper with full guard enforcement.
+	 * Duplicates pipeToRecord() + processDataTransfer() iteration with three guards
+	 * (locking, active-forms, pipe-on-status) checked before any write per field.
+	 * Delegates data assembly to updateDestinationData() (unchanged).
+	 */
+	function pipeToRecordSaveHook($dst_rid) {
+		$record_match_info = $this->projects['destination']['records_match_fields'][$dst_rid];
+		if (empty($record_match_info)) {
+			return;
+		}
+
+		$dest_project_id = $this->projects['destination']['project_id'];
+		$resultData = [];
+
+		// Mirrors pipeToRecord() source project loop
+		foreach ($this->projects['source'] as $p_index => $src_project) {
+			$dest_match_field = $src_project['dest_match_field'];
+			$src_match_field = $src_project['source_match_field'];
+			$source_match_field_is_in_pipe_fields = in_array($src_match_field, $src_project['source_fields'], true) !== false;
+
+			foreach ($src_project['source_data'] as $src_rid => $src_rec) {
+				foreach ($src_rec as $eid => $field_data) {
+					if ($eid == "repeat_instances") {
+						foreach ($field_data as $ieid => $formData) {
+							foreach ($formData as $formName => $instanceData) {
+								foreach ($instanceData as $iNum => $subData) {
+									if ($subData[$src_match_field] != $record_match_info[$dest_match_field]) continue;
+									$resultData = $this->processDataTransferGuarded($resultData, $dst_rid, $src_project, $ieid, $subData, $src_match_field, $dest_match_field, $source_match_field_is_in_pipe_fields, $dest_project_id, $iNum);
+								}
+							}
+						}
+					} else {
+						if ($field_data[$src_match_field] != $record_match_info[$dest_match_field]) continue;
+						$resultData = $this->processDataTransferGuarded($resultData, $dst_rid, $src_project, $eid, $field_data, $src_match_field, $dest_match_field, $source_match_field_is_in_pipe_fields, $dest_project_id);
+					}
+				}
+			}
+		}
+
+		if (!empty($resultData[$dst_rid])) {
+			\REDCap::saveData('array', $resultData);
+		}
+	}
+
+	/**
+	 * Guarded version of processDataTransfer() for the save-hook path.
+	 * Inlines the same event-matching and field iteration logic but enforces
+	 * isFormLocked, isFormOnActiveList, and isFormAbovePipeStatus per field.
+	 * Uses getCachedProject() instead of inline new \Project().
+	 */
+	private function processDataTransferGuarded($currentData, $dst_rid, $src_project, $eid, $field_data, $src_match_field, $dest_match_field, $source_match_field_is_in_pipe_fields, $dest_project_id, $repeat_instance = "") {
+		// Match source event name to destination event (mirrors processDataTransfer event matching)
+		$src_event_name = $src_project['events'][$eid];
+		$dst_event_id = array_search($src_event_name, $this->projects['destination']['events'], true);
+		if ($dst_event_id === false) {
+			return $currentData;
+		}
+
+		// Validate event_id (mirrors processDataTransfer valid_match_event_ids check)
+		if (in_array($eid, (array) $src_project['valid_match_event_ids']) === false) {
+			return $currentData;
+		}
+
+		$destProj = $this->getCachedProject($dest_project_id);
+
+		foreach ($field_data as $field_name => $field_value) {
+			if ($field_name == $src_match_field && !$source_match_field_is_in_pipe_fields) {
+				continue;
+			}
+
+			$pipe_field_index = array_search($field_name, $src_project['source_fields'], true);
+			$dst_name = $src_project['dest_fields'][$pipe_field_index];
+			if (empty($dst_name)) continue;
+
+			$form_name = $src_project['dest_forms_by_field_name'][$dst_name];
+
+			// Guard block — all three checks before any write.
+			// $dst_event_id and $repeat_instance come from piping iteration context,
+			// not from redcap_save_record() hook parameters.
+			if ($this->isFormLocked($dest_project_id, $dst_rid, $dst_event_id, $form_name, $repeat_instance)) {
+				continue;
+			}
+			if (!$this->isFormOnActiveList($form_name, $this->active_forms)) {
+				continue;
+			}
+			if ($this->isFormAbovePipeStatus($dest_project_id, $dst_rid, $dst_event_id, $form_name, $repeat_instance, $this->pipe_on_status)) {
+				continue;
+			}
+
+			$currentData = $this->updateDestinationData($currentData, $destProj, $dst_name, $field_value, $dst_rid, $dst_event_id, $repeat_instance);
+		}
+
+		return $currentData;
 	}
 
     function processDataTransfer($currentData,$dst_rid,$src_project,$eid,$field_data,$src_match_field,$dest_match_field,$source_match_field_is_in_pipe_fields,$repeat_instance = "") {
