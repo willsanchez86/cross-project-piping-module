@@ -12,6 +12,13 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 	public $pipeOnStatus;
 	public $modSettings;
 	public $hideButton = false;
+	/**
+	 * Static flag to prevent infinite recursion during pipe-on-save.
+	 * When pipeToRecord() calls REDCap::saveData(), that triggers the redcap_save_record
+	 * hook again. This flag ensures the re-entrant call exits immediately.
+	 * Must be static because REDCap may instantiate a new module object for nested hook calls.
+	 */
+	private static $isPipingInProgress = false;
 
 	function redcap_every_page_before_render($project_id) {
 		$user_is_at_record_status_dashboard = $_SERVER['SCRIPT_NAME'] == APP_PATH_WEBROOT . "DataEntry/record_status_dashboard.php";
@@ -44,6 +51,74 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 		 * and be made aware of concerns & past discussion.
 		 * For details, see https://redcap.vanderbilt.edu/community/post.php?id=99013
 		 */
+	}
+
+	/**
+	 * Pipe-on-save: automatically trigger cross-project piping whenever a destination
+	 * record is saved (data entry only, not surveys). This gives users server-side piping
+	 * without requiring them to open the data entry form or click the "Pipe All Records" button.
+	 *
+	 * The batch pipeline reused here is identical to what pipe_all_data_ajax.php does:
+	 *   1. getProjects()              – build source/destination project metadata
+	 *   2. getSourceProjectsData()    – fetch all source records with non-empty match fields
+	 *   3. getDestinationProjectData()– fetch destination match field values for all records
+	 *   4. Set up active_forms, pipe_on_status, and formStatuses for filtering
+	 *   5. pipeToRecord($record)      – match + copy source data into this destination record
+	 *
+	 * Guard clauses prevent execution when:
+	 *   - $record is empty (new record with no ID yet)
+	 *   - $isPipingInProgress is true (re-entrant call from saveData inside pipeToRecord)
+	 *   - $survey_hash is present (survey saves — consistent with redcap_survey_page_top)
+	 *   - The "pipe-on-save" project setting is not enabled
+	 */
+	function redcap_save_record($project_id, $record, $instrument, $event_id, $group_id, $survey_hash, $response_id, $repeat_instance) {
+		// REDCap can fire this hook on new records before an ID is assigned
+		if (empty($record)) {
+			return;
+		}
+
+		// Prevent infinite recursion: pipeToRecord() -> saveData() -> redcap_save_record()
+		if (self::$isPipingInProgress) {
+			return;
+		}
+
+		// No piping on survey saves — consistent with redcap_survey_page_top
+		if (!empty($survey_hash)) {
+			return;
+		}
+
+		// Only run when the project admin has opted in via the module config checkbox
+		if (!$this->getProjectSetting('pipe-on-save')) {
+			return;
+		}
+
+		try {
+			// Build source/destination project metadata (same as pipe_all_data_ajax.php line 5-7)
+			$this->projects = $this->getProjects();
+			$this->getSourceProjectsData();
+			$this->getDestinationProjectData();
+
+			// Set up form filtering and status filtering (same as pipe_all_data_ajax.php lines 10-15)
+			$this->active_forms = $this->getProjectSetting('active-forms');
+			if (count($this->active_forms) == 1 && empty($this->active_forms[0])) {
+				$this->active_forms = [];
+			}
+			$this->pipe_on_status = $this->getProjectSetting('pipe-on-status');
+			$this->formStatuses = $this->getFormStatusAllRecords($this->active_forms);
+
+			// Set the recursion guard before piping; clear it in finally so it's
+			// always reset even if pipeToRecord() throws
+			self::$isPipingInProgress = true;
+			try {
+				$this->pipeToRecord($record);
+			} finally {
+				self::$isPipingInProgress = false;
+			}
+		} catch (\Exception $e) {
+			// Fail safely — log but don't break the save. Uses hook_log() to match
+			// the existing logging pattern in hooks_common.php.
+			hook_log("Cross-Project Piping pipe-on-save error for record $record: " . $e->getMessage(), "DEBUG");
+		}
 	}
 
 	function redcap_module_save_configuration($project_id) {
