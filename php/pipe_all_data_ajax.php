@@ -13,6 +13,7 @@ if (count($module->active_forms) == 1 && empty($module->active_forms[0])) {		// 
 }
 $module->pipe_on_status = $module->getProjectSetting('pipe-on-status');
 $module->formStatuses = $module->getFormStatusAllRecords($module->active_forms);
+$module->lockingCache = $module->prefetchLockingData($module->projects['destination']['project_id']);
 $verbose_failure_logging = $module->getProjectSetting("verbose-pipe-all-failure-logging");
 
 $failures = 0;

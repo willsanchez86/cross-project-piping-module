@@ -13,6 +13,18 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 	public $modSettings;
 	public $hideButton = false;
 	/**
+	 * When non-null, holds prefetched locking data for all records in the destination project.
+	 * Used by the batch path (pipe_all_data_ajax.php) to avoid per-field SQL queries.
+	 * Structure: [$record][$event_id][$form_name][$instance] = true
+	 * When null, isFormLocked() falls back to a per-call SQL query (single-record path).
+	 */
+	public $lockingCache = null;
+	/**
+	 * In-memory cache of \Project objects keyed by project ID.
+	 * Avoids re-instantiating the same \Project on every call to processDataTransfer().
+	 */
+	private $projectCache = [];
+	/**
 	 * Static flag to prevent infinite recursion during pipe-on-save.
 	 * When pipeToRecord() calls REDCap::saveData(), that triggers the redcap_save_record
 	 * hook again. This flag ensures the re-entrant call exits immediately.
@@ -119,6 +131,105 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 			// the existing logging pattern in hooks_common.php.
 			hook_log("Cross-Project Piping pipe-on-save error for record $record: " . $e->getMessage(), "DEBUG");
 		}
+	}
+
+	/**
+	 * Check whether a specific form/record/event/instance is locked in redcap_locking_data.
+	 *
+	 * Two code paths:
+	 *   - Batch path: when $this->lockingCache is pre-populated (by prefetchLockingData()),
+	 *     we do a simple array lookup — no SQL. This is used by pipe_all_data_ajax.php.
+	 *   - Single-record path: when lockingCache is null (pipe-on-save), we fall back to
+	 *     a per-call SQL query, matching the pattern used in processRecord().
+	 *
+	 * Instance semantics: redcap_locking_data stores instance = NULL for non-repeating
+	 * forms and instance = 1 for the first repeat. Both mean "instance 1" in practice,
+	 * so when $instance <= 1 we check (instance IS NULL OR instance = 1).
+	 */
+	function isFormLocked(int $project_id, string $record, int $event_id, string $form_name, int $instance = 1): bool {
+		// Batch path: use prefetched cache if available
+		if ($this->lockingCache !== null) {
+			// Normalize instance <= 1 to 1 to match prefetchLockingData()'s NULL→1 normalization
+			$cacheInstance = ($instance <= 1) ? 1 : $instance;
+			return !empty($this->lockingCache[$record][$event_id][$form_name][$cacheInstance]);
+		}
+
+		// Single-record path: direct SQL query
+		$escRecord = db_real_escape_string($record);
+		$escForm = db_real_escape_string($form_name);
+		$pid = intval($project_id);
+		$eid = intval($event_id);
+
+		$sql = "SELECT 1 FROM redcap_locking_data WHERE project_id = {$pid} AND record = '{$escRecord}' AND event_id = {$eid} AND form_name = '{$escForm}'";
+		if ($instance >= 2) {
+			$sql .= " AND instance = " . intval($instance);
+		} else {
+			$sql .= " AND (instance IS NULL OR instance = 1)";
+		}
+		$sql .= " LIMIT 1";
+
+		$result = db_query($sql);
+		return !empty(db_fetch_assoc($result));
+	}
+
+	/**
+	 * Check whether a form is on the configured active-forms list.
+	 *
+	 * Returns true (allow piping) when:
+	 *   - $active_forms is empty (no filtering configured — all forms are active)
+	 *   - $active_forms is the framework-version 2 quirk: single-element array with
+	 *     a null/empty first element (also means "all forms")
+	 *   - $form_name is found in $active_forms
+	 */
+	function isFormOnActiveList(string $form_name, array $active_forms = []): bool {
+		if (empty($active_forms)) {
+			return true;
+		}
+
+		// framework-version 2 can return [[0] => null] which means "all forms"
+		if (count($active_forms) == 1 && empty($active_forms[0])) {
+			return true;
+		}
+
+		return in_array($form_name, $active_forms, true);
+	}
+
+	/**
+	 * Prefetch all locking data for a project in a single SQL query.
+	 *
+	 * Used by the batch path (pipe_all_data_ajax.php) to populate $this->lockingCache
+	 * so that isFormLocked() can do O(1) array lookups instead of per-field SQL queries.
+	 *
+	 * @return array Nested array: [$record][$event_id][$form_name][$instance] = true
+	 *               NULL/empty instance values are normalized to 1.
+	 */
+	function prefetchLockingData(int $project_id): array {
+		$pid = intval($project_id);
+		$sql = "SELECT record, event_id, form_name, instance FROM redcap_locking_data WHERE project_id = {$pid}";
+		$result = db_query($sql);
+
+		$cache = [];
+		while ($row = db_fetch_assoc($result)) {
+			$record = $row['record'];
+			$event_id = $row['event_id'];
+			$form_name = $row['form_name'];
+			// Normalize NULL/empty instance to 1 (non-repeating forms store NULL)
+			$instance = (!empty($row['instance'])) ? intval($row['instance']) : 1;
+			$cache[$record][$event_id][$form_name][$instance] = true;
+		}
+
+		return $cache;
+	}
+
+	/**
+	 * Return a cached \Project instance for the given project ID.
+	 * Avoids re-instantiating \Project on every call to processDataTransfer().
+	 */
+	private function getCachedProject(int $pid): \Project {
+		if (!isset($this->projectCache[$pid])) {
+			$this->projectCache[$pid] = new \Project($pid);
+		}
+		return $this->projectCache[$pid];
 	}
 
 	function redcap_module_save_configuration($project_id) {
@@ -1176,8 +1287,9 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
             return $currentData;
         }
 
-        // create an instance of destination project
-        $destProj = new \Project($this->projects['destination']['projectId']);
+        // get or create a cached instance of destination project
+        $dest_project_id = $this->projects['destination']['project_id'];
+        $destProj = $this->getCachedProject($dest_project_id);
 
         foreach ($field_data as $field_name => $field_value) {
             // skip this field if it's the match field and match field isn't in the set of fields to be piped
@@ -1196,11 +1308,18 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
             // skip this field if the destination record's form status for the containing form is above the pipe limit
             $form_name = $src_project['dest_forms_by_field_name'][$dst_name];
 
-            if (intval($this->formStatuses[$dst_rid][$dst_event_id][$form_name . '_complete']) > $this->pipe_on_status) {
+            // skip if this field's form isn't on the active-forms list (mirrors processRecord's active-form filter)
+            if (!$this->isFormOnActiveList($form_name, $this->active_forms)) {
                 continue;
             }
-            // skip if this field isn't in an 'active' form
-            if (!empty($this->active_forms) && !in_array($form_name, $this->active_forms)) {
+
+            // skip if this field's form is locked for this record/event/instance (mirrors processRecord's lock check)
+            $check_instance = ($repeat_instance === "" || $repeat_instance === null) ? 1 : intval($repeat_instance);
+            if ($this->isFormLocked($dest_project_id, $dst_rid, $dst_event_id, $form_name, $check_instance)) {
+                continue;
+            }
+
+            if (intval($this->formStatuses[$dst_rid][$dst_event_id][$form_name . '_complete']) > $this->pipe_on_status) {
                 continue;
             }
 
