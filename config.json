@@ -120,6 +120,11 @@
 			"repeatable": false
 		},
 		{
+			"key": "pipe-on-save",
+			"name": "Automatically pipe data when a record is saved (server-side)",
+			"type": "checkbox"
+		},
+		{
 			"key": "pipe-on-status",
 			"name": "Allow piping on forms this status or less",
 			"type": "dropdown",

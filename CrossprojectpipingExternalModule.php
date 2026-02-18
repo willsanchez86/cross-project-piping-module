@@ -13,6 +13,8 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 	public $modSettings;
 	public $hideButton = false;
 
+	private static $isPipingInProgress = false;
+
 	function redcap_every_page_before_render($project_id) {
 		$user_is_at_record_status_dashboard = $_SERVER['SCRIPT_NAME'] == APP_PATH_WEBROOT . "DataEntry/record_status_dashboard.php";
 		$pipe_all_records_button_configured = $this->getProjectSetting('piping-all-records-button');
@@ -44,6 +46,42 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 		 * and be made aware of concerns & past discussion.
 		 * For details, see https://redcap.vanderbilt.edu/community/post.php?id=99013
 		 */
+	}
+
+	/**
+	 * Pipe-on-save: server-side piping on record save (data entry only, not surveys).
+	 * Reuses the same pipeline as pipe_all_data_ajax.php. Gated by 'pipe-on-save' config.
+	 * $isPipingInProgress prevents recursion from pipeToRecord() -> saveData() -> this hook.
+	 */
+	function redcap_save_record($project_id, $record, $instrument, $event_id, $group_id, $survey_hash, $response_id, $repeat_instance) {
+		if (empty($record)) return;                          // no ID yet (new record)
+		if (self::$isPipingInProgress) return;                // recursion guard
+		if (!empty($survey_hash)) return;                     // surveys excluded
+		if (!$this->getProjectSetting('pipe-on-save')) return; // feature not enabled
+
+		self::$isPipingInProgress = true;
+		try {
+			$this->projects = $this->getProjects();
+
+			// processDataTransfer() reads 'projectId' (camelCase) but getProjects() sets
+			// 'project_id' (snake_case). Alias here so we don't rely on \Project(null)
+			// falling back to the PROJECT_ID constant.
+			$this->projects['destination']['projectId'] = $this->projects['destination']['project_id'];
+
+			$this->getSourceProjectsData();
+			$this->getDestinationProjectData();
+
+			$this->active_forms = $this->getProjectSetting('active-forms');
+			if (count($this->active_forms) == 1 && empty($this->active_forms[0])) {
+				$this->active_forms = [];  // framework quirk: [[0] => null]
+			}
+			$this->pipe_on_status = $this->getProjectSetting('pipe-on-status');
+			$this->formStatuses = $this->getFormStatusAllRecords($this->active_forms);
+
+			$this->pipeToRecord($record);
+		} finally {
+			self::$isPipingInProgress = false;
+		}
 	}
 
 	function redcap_module_save_configuration($project_id) {
