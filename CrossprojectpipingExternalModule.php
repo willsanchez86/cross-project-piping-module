@@ -66,14 +66,7 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 		self::$isPipingInProgress = true;
 		try {
 			$this->projects = $this->getProjects();
-
-			// processDataTransfer() reads 'projectId' (camelCase) but getProjects() sets
-			// 'project_id' (snake_case). Alias here so we don't rely on \Project(null)
-			// falling back to the PROJECT_ID constant.
 			$this->projects['destination']['projectId'] = $this->projects['destination']['project_id'];
-
-			$this->getSourceProjectsData();
-			$this->getDestinationProjectData();
 
 			$this->active_forms = $this->getProjectSetting('active-forms');
 			if (count($this->active_forms) == 1 && empty($this->active_forms[0])) {
@@ -81,7 +74,28 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 			}
 			$this->pipe_on_status = $this->getProjectSetting('pipe-on-status');
 
-			// Guarded piping — uses direct SQL guards instead of array-based formStatuses
+			// 1. Fetch destination record's match field values (scoped to single record)
+			$this->getDestinationProjectDataForRecord($record);
+
+			// 2. Derive dest_match_info from the populated records_match_fields
+			$dest_match_info = $this->projects['destination']['records_match_fields'][$record] ?? [];
+
+			// 3. Early return if all match field values are empty — nothing to match against
+			$has_match_value = false;
+			foreach ($dest_match_info as $field => $value) {
+				if ($value !== '' && $value !== null) {
+					$has_match_value = true;
+					break;
+				}
+			}
+			if (!$has_match_value) {
+				return;
+			}
+
+			// 4. Fetch source project data scoped to records matching dest_match_info
+			$this->getSourceProjectsDataForRecord($dest_match_info);
+
+			// 5. Guarded piping (unchanged from Commit 2)
 			$this->pipeToRecordSaveHook($record);
 		} finally {
 			self::$isPipingInProgress = false;
@@ -1010,8 +1024,14 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 	}
 
 	/**
-	 * Checks whether a form/instance is locked.
-	 * Extracted from inline SQL in processRecord() (lines 382-386).
+	 * Checks whether a specific form/instance is locked in the redcap_locking_data table.
+	 *
+	 * Extracted from the inline SQL guard in processRecord(), which performs
+	 * the same check for the form-load path. This standalone version is parameterized for
+	 * reuse across server-side paths (save-hook, batch).
+	 *
+	 * In a future refactor, this method could replace the inline SQL in processRecord(),
+	 * providing a single source of truth for locking checks across all piping paths.
 	 */
 	function isFormLocked($project_id, $record, $event_id, $form_name, $instance) {
 		$project_id = intval($project_id);
@@ -1038,8 +1058,15 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 	}
 
 	/**
-	 * Checks whether a form's status exceeds the pipe-on-status threshold.
-	 * Extracted from inline SQL in processRecord() (lines 390-401).
+	 * Checks whether a form's completion status exceeds the configured pipe-on-status threshold.
+	 *
+	 * Extracted from the inline SQL guard in processRecord(), which performs
+	 * the same check for the form-load path. Also parallels the array-based check in
+	 * processDataTransfer(), which uses pre-fetched formStatuses data.
+	 *
+	 * In a future refactor, this method could replace both the inline SQL in processRecord()
+	 * and the array-based check in processDataTransfer(), providing a single source of truth
+	 * for pipe-on-status enforcement across all piping paths.
 	 */
 	function isFormAbovePipeStatus($project_id, $record, $event_id, $form_name, $instance, $pipe_on_status) {
 		if ($pipe_on_status === null || $pipe_on_status === '') return false;
@@ -1071,7 +1098,13 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 
 	/**
 	 * Checks whether a form is on the configured active-forms list.
-	 * Extracted from inline check in processRecord() (lines 374-378).
+	 *
+	 * Extracted from the inline check in processRecord(), which performs
+	 * the same filtering for the form-load path. Also parallels the check in
+	 * processDataTransfer().
+	 *
+	 * In a future refactor, this method could replace both inline checks, providing a
+	 * single source of truth for active-form filtering across all piping paths.
 	 */
 	function isFormOnActiveList($form_name, $active_forms) {
 		// Empty list or framework [null] quirk means all forms are active
@@ -1082,8 +1115,16 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 
 	/**
 	 * Batch-fetches all locking data for a project in a single SQL query.
-	 * Returns [$record][$event_id][$form_name][$instance] = true for O(1) lookups.
-	 * Currently unused — intended for future batch path optimization.
+	 *
+	 * Returns a nested lookup array for O(1) lock checks per form/instance.
+	 * Currently unused — isFormLocked() performs per-form queries which is
+	 * appropriate for the single-record save-hook path. This method is intended
+	 * for future use in the batch ("Pipe All Records") path where per-form queries
+	 * would be prohibitively expensive (N records × M forms = N×M queries).
+	 *
+	 * In a future refactor, the batch endpoint (pipe_all_data_ajax.php) could call
+	 * prefetchLockingData() once, then check the returned array instead of calling
+	 * isFormLocked() per form, closing the batch path's locking gap efficiently.
 	 */
 	function prefetchLockingData($project_id) {
 		$project_id = intval($project_id);
@@ -1100,8 +1141,13 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 	}
 
 	/**
-	 * Returns a cached \Project instance, avoiding repeated instantiation.
-	 * processDataTransfer() creates new \Project() on every call.
+	 * Returns a cached \Project instance, avoiding repeated instantiation in loops.
+	 *
+	 * processDataTransfer() creates a new \Project() on every call.
+	 * In the save-hook path this is called once; in the batch path it's called
+	 * once per source record per destination record. This method provides the
+	 * caching layer for pipeToRecordSaveHook() and could replace the inline
+	 * instantiation in processDataTransfer() in a future refactor.
 	 */
 	function getCachedProject($pid) {
 		$pid = intval($pid);
@@ -1136,7 +1182,54 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 			$this->projects['source'][$project_index]['source_data'] = \REDCap::getData($params);
 		}
 	}
-	
+
+	/**
+	 * Save-hook variant of getSourceProjectsData(). Fetches source data scoped to records
+	 * matching a specific destination match value, instead of all non-empty records.
+	 *
+	 * For each source project, uses filterLogic with an exact-match expression
+	 * ([$match_field] = 'value') instead of the broad non-empty filter ([$match_field] <> '').
+	 * If the destination has no value for a source project's match field, that source project's
+	 * source_data is set to an empty array (no fetch at all).
+	 *
+	 * @param array $dest_match_info Destination record's match field values,
+	 *        keyed by field name (from records_match_fields[$record]).
+	 */
+	function getSourceProjectsDataForRecord($dest_match_info) {
+		foreach ($this->projects['source'] as $project_index => $project) {
+			$project_id = $project['project_id'];
+			$match_field = $project['source_match_field'];
+			$dest_match_field = $project['dest_match_field'];
+
+			// Look up the destination record's value for this source project's match field
+			$match_value = $dest_match_info[$dest_match_field] ?? '';
+
+			// If the destination has no match value, there's nothing to match against —
+			// skip the fetch entirely
+			if ($match_value === '' || $match_value === null) {
+				$this->projects['source'][$project_index]['source_data'] = [];
+				continue;
+			}
+
+			$fields = $project['source_fields'];
+			if (!in_array($match_field, $fields)) {
+				$fields[] = $match_field;
+			}
+
+			// Escape single quotes in the match value for filterLogic
+			$escaped_value = str_replace("'", "\\'", $match_value);
+
+			$params = [
+				'project_id' => $project_id,
+				'return_format' => 'array',
+				'fields' => $fields,
+				'filterLogic' => "[$match_field] = '$escaped_value'"
+			];
+
+			$this->projects['source'][$project_index]['source_data'] = \REDCap::getData($params);
+		}
+	}
+
 	function getDestinationProjectData() {
 		if (gettype($this->projects) == 'Array') {
 			throw new \Exception("The Cross Project Piping module expected \$module->projects to be an array before calling pipeToRecord()");
@@ -1169,7 +1262,46 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 		
 		$this->projects['destination']['records_match_fields'] = $data;
 	}
-	
+
+	/**
+	 * Save-hook variant of getDestinationProjectData(). Fetches match field values
+	 * for a single destination record instead of all records.
+	 *
+	 * Uses 'records' => [$record_id] in REDCap::getData() params to scope the fetch.
+	 * Populates the same records_match_fields data structure as getDestinationProjectData().
+	 *
+	 * @param string $record_id The destination record to fetch match field values for.
+	 */
+	function getDestinationProjectDataForRecord($record_id) {
+		// get all destination match field names
+		$match_field_names = [];
+		foreach ($this->projects['source'] as $project_index => $project) {
+			$match_field_names[] = $project['dest_match_field'];
+		}
+		$match_field_names = array_unique($match_field_names);
+
+		$params = [
+			'project_id' => $this->projects['destination']['project_id'],
+			'return_format' => 'array',
+			'fields' => $match_field_names,
+			'records' => [$record_id]
+		];
+		$data = \REDCap::getData($params);
+
+		// extract match field info from event arrays (same as getDestinationProjectData)
+		foreach($data as $rid => $events) {
+			$match_info = [];
+			foreach ($events as $eid => $recdata) {
+				foreach($recdata as $field => $value) {
+					$match_info["$field"] = $value;
+				}
+			}
+			$data[$rid] = $match_info;
+		}
+
+		$this->projects['destination']['records_match_fields'] = $data;
+	}
+
 	function pipeToRecord($dst_rid) {
 		if (gettype($this->projects) == 'Array') {
 			throw new \Exception("The Cross Project Piping module expected \$module->projects to be an array before calling pipeToRecord()");
@@ -1231,10 +1363,33 @@ class CrossprojectpipingExternalModule extends AbstractExternalModule
 	}
 
 	/**
-	 * Save-hook piping wrapper with full guard enforcement.
-	 * Duplicates pipeToRecord() + processDataTransfer() iteration with three guards
-	 * (locking, active-forms, pipe-on-status) checked before any write per field.
-	 * Delegates data assembly to updateDestinationData() (unchanged).
+	 * Save-hook-specific piping method that replaces pipeToRecord() in the save-hook path.
+	 *
+	 * This method duplicates the core logic of pipeToRecord() and
+	 * processDataTransfer() with three key differences:
+	 *
+	 * 1. Uses getCachedProject() instead of inline new \Project() instantiation.
+	 * 2. Enforces a complete guard decision block before any write for each
+	 *    form/instance — all three guards are checked at the same point:
+	 *    - isFormLocked(): skip if form/instance is locked
+	 *    - isFormOnActiveList(): skip if form is not on the active-forms list
+	 *    - isFormAbovePipeStatus(): skip if form status exceeds threshold
+	 * 3. Still uses broad-fetched data from $this->projects (same as Commit 1).
+	 *    Commit 3 replaces broad fetches with scoped single-record fetches.
+	 *
+	 * The duplication boundary is the iteration and guard logic only. This method
+	 * delegates actual data structure assembly to the existing updateDestinationData(),
+	 * which is called as-is without modification.
+	 *
+	 * This duplication exists because the original pipeToRecord() and processDataTransfer()
+	 * cannot be modified under project constraints. The originals remain the code path for
+	 * the batch endpoint (pipe_all_data_ajax.php) and are untouched.
+	 *
+	 * In a future refactor, this guarded logic could be merged back into
+	 * processDataTransfer() (adding the locking check alongside the existing active-form
+	 * and status checks), and pipeToRecord() could be updated to use scoped fetches when
+	 * operating on a single record. This would collapse the duplication and give all paths
+	 * (form-load, save-hook, batch) consistent guard enforcement.
 	 */
 	function pipeToRecordSaveHook($dst_rid) {
 		$record_match_info = $this->projects['destination']['records_match_fields'][$dst_rid];
